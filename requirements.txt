@@ -1,0 +1,9 @@
+streamlit
+pdfplumber
+spacy
+speechrecognition
+gtts
+pydub
+matplotlib
+python-dotenv
+requests
