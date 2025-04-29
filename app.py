@@ -1,4 +1,4 @@
-# SmartHire AI - Streamlit Version (Fully Integrated with Jooble & PySpark)
+# SmartHire AI - Streamlit Version (With Admin Dashboard & Visuals)
 
 import streamlit as st
 import pandas as pd
@@ -7,18 +7,30 @@ import csv
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
-from pyspark.sql import SparkSession
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
 import zipfile
 import gdown
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PyPDF2 import PdfReader
+from groq import Groq
+
+# Set Streamlit page config
+st.set_page_config(
+    page_title="SmartHire AI",
+    page_icon="🧠",
+    layout="centered",
+    initial_sidebar_state="expanded"
+)
 
 # Load environment variables
 load_dotenv()
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 JOOBLE_API_KEY = os.getenv("JOOBLE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@smarthireai.com")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
@@ -29,12 +41,11 @@ REPORTS_FILE = os.path.join(DATA_FOLDER, "interview_reports.csv")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
-# Helper: Download & unzip LinkedIn dataset
 @st.cache_resource
 def download_and_extract_dataset():
-    url_id = "1gJW9kgdfnVU1FzlzijRiup_8gkJNit82"
+    url = "https://drive.google.com/uc?id=1gJW9kgdfnVU1FzlzijRiup_8gkJNit82"
     zip_path = "linkedin_dataset.zip"
-    gdown.download(id=url_id, output=zip_path, quiet=False)
+    gdown.download(url, output=zip_path, quiet=False)
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(DATA_FOLDER)
     os.remove(zip_path)
@@ -42,31 +53,43 @@ def download_and_extract_dataset():
 
 DATA_FILE = download_and_extract_dataset()
 
-# Resume Parsing Dummy
 @st.cache_data
 def parse_resume(file_path):
-    return {
-        "name": "John Doe",
-        "email": "john@example.com",
-        "skills": ["Python", "Data Analysis", "Machine Learning"],
-        "experience": "2 years at ABC Corp",
-        "education": "B.Sc. in Computer Science"
-    }
+    try:
+        reader = PdfReader(file_path)
+        full_text = "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+        lines = full_text.split("\n")
+        email = next((line for line in lines if "@" in line and "." in line), "not_found@example.com")
+        name = lines[0] if lines else "Unknown"
+        return {
+            "name": name.strip(),
+            "email": email.strip(),
+            "skills": [word for word in full_text.split() if word.istitle() and len(word) > 3][:10],
+            "experience": "Extracted from resume",
+            "education": "Extracted from resume",
+            "full_text": full_text
+        }
+    except Exception as e:
+        st.warning(f"Resume parsing failed: {e}")
+        return {"name": "Unknown", "email": "error@example.com", "skills": [], "experience": "", "education": "", "full_text": ""}
 
-# Generate Questions
-def generate_questions(role):
-    return [
-        f"What are the key responsibilities of a {role}?",
-        f"How do you stay updated with trends in {role}?",
-        f"Explain a project where you demonstrated {role}-related skills."
-    ]
+def generate_questions_from_groq(resume_text):
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        prompt = f"""Based on the following resume, ask 3 technical and 2 behavioral interview questions:
+\n{resume_text}"""
+        chat_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="mixtral-8x7b-32768"
+        )
+        return chat_completion.choices[0].message.content.strip().split("\n")
+    except Exception as e:
+        return [f"Error generating questions: {e}"]
 
-# Score Calculation
 def calculate_score(answers, keywords):
     score = sum(1 for ans, kw in zip(answers, keywords) if kw.lower() in ans.lower())
     return round((score / len(keywords)) * 100, 2)
 
-# Jooble Integration
 def fetch_job_recommendations(role, location="India"):
     try:
         url = f"https://jooble.org/api/{JOOBLE_API_KEY}"
@@ -79,20 +102,37 @@ def fetch_job_recommendations(role, location="India"):
         st.error(f"Jooble Error: {e}")
         return []
 
-# PySpark Feedback
-def generate_bigdata_feedback(user_skills):
+def generate_data_visuals(user_skills):
     try:
-        spark = SparkSession.builder.appName("LinkedInAnalysis").getOrCreate()
-        df = spark.read.csv(DATA_FILE, header=True, inferSchema=True)
-        df = df.dropna(subset=["Skills"])
-        skill_match_count = df.rdd.map(lambda row: len(set(user_skills).intersection(set(row["Skills"].split(','))))).sum()
-        avg_match = round(skill_match_count / df.count(), 2)
-        spark.stop()
-        return f"Your skills match an average of {avg_match} LinkedIn profiles."
-    except Exception as e:
-        return f"Error analyzing LinkedIn data: {e}"
+        df = pd.read_csv(DATA_FILE)
+        st.subheader("LinkedIn Insights")
 
-# Email Feedback
+        if 'Skills' in df.columns:
+            st.write("### Most Common Skills")
+            df['Skills'] = df['Skills'].fillna('')
+            all_skills = pd.Series(','.join(df['Skills']).split(',')).str.strip().value_counts().head(10)
+            fig, ax = plt.subplots()
+            sns.barplot(x=all_skills.values, y=all_skills.index, ax=ax)
+            st.pyplot(fig)
+
+        if 'Company' in df.columns:
+            st.write("### Top Companies Hiring")
+            top_companies = df['Company'].value_counts().head(10)
+            fig, ax = plt.subplots()
+            sns.barplot(x=top_companies.values, y=top_companies.index, ax=ax)
+            st.pyplot(fig)
+
+        if 'Region' in df.columns and 'Salary' in df.columns:
+            st.write("### Average Salary by Region")
+            region_salary = df.groupby('Region')['Salary'].mean().sort_values(ascending=False).head(10)
+            fig, ax = plt.subplots()
+            region_salary.plot(kind='barh', ax=ax)
+            st.pyplot(fig)
+
+        return "Visual feedback generated."
+    except Exception as e:
+        return f"Error in visual feedback: {e}"
+
 def send_feedback_email(to_email, name, role, score, feedback_note):
     try:
         msg = MIMEMultipart()
@@ -109,62 +149,67 @@ def send_feedback_email(to_email, name, role, score, feedback_note):
     except Exception as e:
         st.warning(f"Email error: {e}")
 
-# Streamlit App
-st.title("SmartHire AI - Career Interview Assistant")
+# --- Sidebar Role Selection ---
+role = st.sidebar.selectbox("Select Mode", ["Candidate", "Admin"])
 
-if "resume" not in st.session_state:
-    st.session_state.resume = {}
-
-with st.sidebar:
-    st.header("Admin Login")
-    admin_user = st.text_input("Email")
-    admin_pass = st.text_input("Password", type="password")
-    if st.button("View Reports"):
-        if admin_user == ADMIN_EMAIL and admin_pass == ADMIN_PASSWORD:
+if role == "Admin":
+    st.sidebar.subheader("🔐 Admin Login")
+    input_email = st.sidebar.text_input("Admin Email")
+    input_password = st.sidebar.text_input("Password", type="password")
+    
+    if st.sidebar.button("Login"):
+        if input_email == ADMIN_EMAIL and input_password == ADMIN_PASSWORD:
+            st.success("✅ Logged in as Admin")
             if os.path.exists(REPORTS_FILE):
-                df = pd.read_csv(REPORTS_FILE, names=["Name", "Email", "Role", "Score", "Date"])
-                st.dataframe(df)
-                st.download_button("Download Reports CSV", df.to_csv(index=False), "interview_reports.csv")
+                df_reports = pd.read_csv(REPORTS_FILE)
+                st.subheader("📋 All Interview Reports")
+                st.dataframe(df_reports)
             else:
-                st.info("No reports yet.")
+                st.info("No reports available yet.")
         else:
-            st.warning("Invalid credentials.")
+            st.error("❌ Invalid admin credentials.")
+else:
+    st.title("SmartHire AI – Job Interview Assistant 🧠")
+    st.write("Upload your resume to receive AI-generated interview questions, score analysis, job recommendations, and LinkedIn-based skill insights.")
 
-st.subheader("Upload Your Resume")
-input_lang = st.selectbox("Input Language", ["English", "Hindi", "French"])
-output_lang = st.selectbox("Output Language", ["English", "Hindi", "French"])
-file = st.file_uploader("Upload Resume (PDF)", type=["pdf"])
+    uploaded_file = st.file_uploader("Upload Resume (PDF only)", type=["pdf"])
 
-if file:
-    file_path = os.path.join(UPLOAD_FOLDER, file.name)
-    with open(file_path, "wb") as f:
-        f.write(file.read())
-    resume_data = parse_resume(file_path)
-    st.session_state.resume = resume_data
-    st.success("Resume parsed successfully!")
-    st.write(resume_data)
+    if uploaded_file is not None:
+        file_path = os.path.join(UPLOAD_FOLDER, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.read())
 
-    role = st.text_input("Enter your desired role")
-    if role:
-        questions = generate_questions(role)
-        st.session_state.questions = questions
-        st.write("### Interview Questions")
+        resume_data = parse_resume(file_path)
+        st.write("### Extracted Resume Data")
+        st.json(resume_data)
+
+        st.write("---")
+        st.subheader("Interview Questions")
+        questions = generate_questions_from_groq(resume_data['full_text'])
         answers = []
         for i, q in enumerate(questions):
-            ans = st.text_area(f"{i+1}. {q}", key=f"answer_{i}")
+            ans = st.text_input(f"Q{i+1}: {q}", key=f"q_{i}")
             answers.append(ans)
 
         if st.button("Submit Interview"):
-            score = calculate_score(answers, ["responsibilities", "trends", "project"])
-            feedback_note = generate_bigdata_feedback(resume_data['skills'])
-            now = datetime.now().strftime("%Y-%m-%d %H:%M")
-            with open(REPORTS_FILE, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([resume_data['name'], resume_data['email'], role, score, now])
-            send_feedback_email(resume_data['email'], resume_data['name'], role, score, feedback_note)
-            jobs = fetch_job_recommendations(role)
+            score = calculate_score(answers, resume_data['skills'])
             st.success(f"Interview Score: {score}%")
-            st.info(feedback_note)
-            st.write("### Job Recommendations")
+
+            feedback = generate_data_visuals(resume_data['skills'])
+            send_feedback_email(resume_data['email'], resume_data['name'], resume_data['skills'][0] if resume_data['skills'] else 'Candidate', score, feedback)
+
+            with open(REPORTS_FILE, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                if os.path.getsize(REPORTS_FILE) == 0:
+                    writer.writerow(["name", "email", "role", "score", "timestamp"])
+                writer.writerow([resume_data['name'], resume_data['email'], resume_data['skills'][0] if resume_data['skills'] else 'N/A', score, datetime.now().isoformat()])
+
+            st.success("Report sent and saved ✅")
+
+            st.write("---")
+            st.subheader("Job Recommendations via Jooble")
+            jobs = fetch_job_recommendations(resume_data['skills'][0] if resume_data['skills'] else "developer")
             for job in jobs:
-                st.write(f"**{job.get('title')}** at {job.get('company')}\n{job.get('snippet')}\n[View Job]({job.get('link')})")
+                st.markdown(f"**{job.get('title', 'N/A')}**  ")
+                st.markdown(f"{job.get('company', 'Unknown')} | {job.get('location', 'N/A')}  ")
+                st.markdown(f"[View Job Posting]({job.get('link')})")
