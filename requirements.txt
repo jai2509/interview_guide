@@ -20,4 +20,5 @@ PyPDF2
 groq
 numpy
 huggingface_hub
+sklearn
 
