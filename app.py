@@ -1,29 +1,18 @@
-# SmartHire AI - Streamlit Version (With Admin Dashboard & Visuals)
-
 import streamlit as st
 import pandas as pd
-import os
-import csv
+import numpy as np
 import requests
-from datetime import datetime
-from dotenv import load_dotenv
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os
 import smtplib
-import zipfile
-import gdown
-import matplotlib.pyplot as plt
-import seaborn as sns
+import ssl
+from email.message import EmailMessage
 from PyPDF2 import PdfReader
-from groq import Groq
-
-# Set Streamlit page config
-st.set_page_config(
-    page_title="SmartHire AI",
-    page_icon="🧠",
-    layout="centered",
-    initial_sidebar_state="expanded"
-)
+from dotenv import load_dotenv
+from sklearn.metrics.pairwise import cosine_similarity
+from huggingface_hub import InferenceClient
+import json
+import zipfile
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -31,185 +20,159 @@ EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 JOOBLE_API_KEY = os.getenv("JOOBLE_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@smarthireai.com")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
-UPLOAD_FOLDER = "uploads"
-DATA_FOLDER = "data"
-REPORTS_FILE = os.path.join(DATA_FOLDER, "interview_reports.csv")
+# Constants
+DRIVE_FILE_ID = "1RxxUscA5xQqLRJXLgrRQrCrTphKN9QyQ"
+GDRIVE_URL = f"https://drive.google.com/uc?id={DRIVE_FILE_ID}"
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(DATA_FOLDER, exist_ok=True)
-
-@st.cache_resource
-def download_and_extract_dataset():
-    url = "https://drive.google.com/uc?id=1gJW9kgdfnVU1FzlzijRiup_8gkJNit82"
-    zip_path = "linkedin_dataset.zip"
-    gdown.download(url, output=zip_path, quiet=False)
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(DATA_FOLDER)
-    os.remove(zip_path)
-    return os.path.join(DATA_FOLDER, "linkedin_dataset.csv")
-
-DATA_FILE = download_and_extract_dataset()
-
+# Cache data load
 @st.cache_data
-def parse_resume(file_path):
+def download_and_extract_dataset():
+    zip_path = tempfile.NamedTemporaryFile(delete=False, suffix=".zip").name
     try:
-        reader = PdfReader(file_path)
-        full_text = "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
-        lines = full_text.split("\n")
-        email = next((line for line in lines if "@" in line and "." in line), "not_found@example.com")
-        name = lines[0] if lines else "Unknown"
-        return {
-            "name": name.strip(),
-            "email": email.strip(),
-            "skills": [word for word in full_text.split() if word.istitle() and len(word) > 3][:10],
-            "experience": "Extracted from resume",
-            "education": "Extracted from resume",
-            "full_text": full_text
-        }
+        response = requests.get(GDRIVE_URL)
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            extract_path = tempfile.mkdtemp()
+            zip_ref.extractall(extract_path)
+        csv_files = [os.path.join(extract_path, f) for f in os.listdir(extract_path) if f.endswith(".csv")]
+        if csv_files:
+            return pd.read_csv(csv_files[0])
     except Exception as e:
-        st.warning(f"Resume parsing failed: {e}")
-        return {"name": "Unknown", "email": "error@example.com", "skills": [], "experience": "", "education": "", "full_text": ""}
+        st.error(f"Error downloading dataset: {e}")
+        return pd.DataFrame()
 
-def generate_questions_from_groq(resume_text):
+dataset = download_and_extract_dataset()
+
+# Resume parsing
+def parse_resume(pdf_file):
+    reader = PdfReader(pdf_file)
+    text = "".join(page.extract_text() for page in reader.pages if page.extract_text())
+    return text
+
+# Get questions from dataset
+def get_questions_from_dataset(role):
+    if dataset.empty or 'role' not in dataset.columns:
+        return []
+    questions = dataset[dataset['role'].str.lower() == role.lower()]
+    return questions['questions'].tolist()[:5] if not questions.empty else []
+
+# Score answers using GROQ
+def score_answers(questions, answers):
+    if not questions or not answers:
+        return 0, []
+    prompt = "\n".join([f"Q{i+1}: {q}\nA{i+1}: {a}" for i, (q, a) in enumerate(zip(questions, answers))])
+    messages = [{"role": "user", "content": f"Evaluate these answers and provide a score out of 10:\n{prompt}"}]
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={"model": "mixtral-8x7b-32768", "messages": messages}
+    )
+    result = response.json()
     try:
-        client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"""Based on the following resume, ask 3 technical and 2 behavioral interview questions:
-\n{resume_text}"""
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="mixtral-8x7b-32768"
-        )
-        return chat_completion.choices[0].message.content.strip().split("\n")
-    except Exception as e:
-        return [f"Error generating questions: {e}"]
+        feedback = result["choices"][0]["message"]["content"]
+        score = int([int(s) for s in feedback.split() if s.isdigit()][0])
+    except:
+        score = 0
+        feedback = "Could not extract score."
+    return score, feedback
 
-def calculate_score(answers, keywords):
-    score = sum(1 for ans, kw in zip(answers, keywords) if kw.lower() in ans.lower())
-    return round((score / len(keywords)) * 100, 2)
-
-def fetch_job_recommendations(role, location="India"):
+# Job recommendations
+def get_job_recommendations(title, location="India"):
+    url = f"https://jooble.org/api/{JOOBLE_API_KEY}"
+    payload = {"keywords": title, "location": location}
     try:
-        url = f"https://jooble.org/api/{JOOBLE_API_KEY}"
-        headers = {"Content-Type": "application/json"}
-        payload = {"keywords": role, "location": location, "page": 1, "searchMode": 1}
-        response = requests.post(url, json=payload, headers=headers)
-        jobs = response.json().get("jobs", [])
-        return jobs[:5]
-    except Exception as e:
-        st.error(f"Jooble Error: {e}")
+        response = requests.post(url, json=payload)
+        jobs = response.json().get('jobs', [])[:3]
+        return [(job["title"], job["location"], job["link"]) for job in jobs]
+    except:
         return []
 
-def generate_data_visuals(user_skills):
-    try:
-        df = pd.read_csv(DATA_FILE)
-        st.subheader("LinkedIn Insights")
-
-        if 'Skills' in df.columns:
-            st.write("### Most Common Skills")
-            df['Skills'] = df['Skills'].fillna('')
-            all_skills = pd.Series(','.join(df['Skills']).split(',')).str.strip().value_counts().head(10)
-            fig, ax = plt.subplots()
-            sns.barplot(x=all_skills.values, y=all_skills.index, ax=ax)
-            st.pyplot(fig)
-
-        if 'Company' in df.columns:
-            st.write("### Top Companies Hiring")
-            top_companies = df['Company'].value_counts().head(10)
-            fig, ax = plt.subplots()
-            sns.barplot(x=top_companies.values, y=top_companies.index, ax=ax)
-            st.pyplot(fig)
-
-        if 'Region' in df.columns and 'Salary' in df.columns:
-            st.write("### Average Salary by Region")
-            region_salary = df.groupby('Region')['Salary'].mean().sort_values(ascending=False).head(10)
-            fig, ax = plt.subplots()
-            region_salary.plot(kind='barh', ax=ax)
-            st.pyplot(fig)
-
-        return "Visual feedback generated."
-    except Exception as e:
-        return f"Error in visual feedback: {e}"
-
-def send_feedback_email(to_email, name, role, score, feedback_note):
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = EMAIL_USER
-        msg['To'] = to_email
-        msg['Subject'] = f"SmartHire AI Interview Report – {role}"
-        body = f"""Hello {name},\n\nThank you for your interview.\nScore: {score}%\n\nInsights:\n{feedback_note}\n\nBest,\nSmartHire AI"""
-        msg.attach(MIMEText(body, 'plain'))
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
+# Send email
+def send_email(to, subject, body):
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg["From"] = EMAIL_USER
+    msg["To"] = to
+    msg["Subject"] = subject
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
         server.login(EMAIL_USER, EMAIL_PASS)
-        server.sendmail(EMAIL_USER, to_email, msg.as_string())
-        server.quit()
-    except Exception as e:
-        st.warning(f"Email error: {e}")
+        server.send_message(msg)
 
-# --- Sidebar Role Selection ---
-role = st.sidebar.selectbox("Select Mode", ["Candidate", "Admin"])
+# App UI
+st.set_page_config(page_title="SmartHire AI", layout="centered")
+st.title("🤖 SmartHire AI Interview Assistant")
 
-if role == "Admin":
-    st.sidebar.subheader("🔐 Admin Login")
-    input_email = st.sidebar.text_input("Admin Email")
-    input_password = st.sidebar.text_input("Password", type="password")
-    
-    if st.sidebar.button("Login"):
-        if input_email == ADMIN_EMAIL and input_password == ADMIN_PASSWORD:
-            st.success("✅ Logged in as Admin")
-            if os.path.exists(REPORTS_FILE):
-                df_reports = pd.read_csv(REPORTS_FILE)
-                st.subheader("📋 All Interview Reports")
-                st.dataframe(df_reports)
-            else:
-                st.info("No reports available yet.")
+menu = st.sidebar.selectbox("Menu", ["Candidate", "Admin Dashboard"])
+
+if menu == "Candidate":
+    name = st.text_input("Your Name")
+    email = st.text_input("Your Email")
+    role = st.selectbox("Choose Role", dataset["role"].unique() if not dataset.empty else ["Data Scientist", "ML Engineer"])
+    resume_file = st.file_uploader("Upload Resume (PDF)", type="pdf")
+
+    if resume_file:
+        resume_text = parse_resume(resume_file)
+        st.success("Resume parsed successfully.")
+
+    if st.button("Start Interview"):
+        if not resume_file or not role:
+            st.warning("Please upload a resume and choose a role.")
         else:
-            st.error("❌ Invalid admin credentials.")
-else:
-    st.title("SmartHire AI – Job Interview Assistant 🧠")
-    st.write("Upload your resume to receive AI-generated interview questions, score analysis, job recommendations, and LinkedIn-based skill insights.")
+            questions = get_questions_from_dataset(role)
+            answers = []
+            for q in questions:
+                answers.append(st.text_input(q, key=q))
+            if st.button("Submit Answers"):
+                score, feedback = score_answers(questions, answers)
+                st.markdown(f"### Score: {score}/10")
+                st.markdown("#### Feedback")
+                st.write(feedback)
 
-    uploaded_file = st.file_uploader("Upload Resume (PDF only)", type=["pdf"])
+                jobs = get_job_recommendations(role)
+                st.markdown("#### Recommended Jobs")
+                for title, loc, link in jobs:
+                    st.write(f"- [{title} ({loc})]({link})")
 
-    if uploaded_file is not None:
-        file_path = os.path.join(UPLOAD_FOLDER, uploaded_file.name)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.read())
+                body = f"Hi {name},\n\nYour interview score: {score}/10.\nFeedback:\n{feedback}\n\nGood luck!\nSmartHire AI"
+                try:
+                    send_email(email, "Your SmartHire AI Interview Results", body)
+                    st.success("Results sent via email.")
+                except Exception as e:
+                    st.error(f"Failed to send email: {e}")
 
-        resume_data = parse_resume(file_path)
-        st.write("### Extracted Resume Data")
-        st.json(resume_data)
+                # Save report for admin
+                report = {
+                    "name": name,
+                    "email": email,
+                    "role": role,
+                    "score": score,
+                    "feedback": feedback
+                }
+                if "reports" not in st.session_state:
+                    st.session_state["reports"] = []
+                st.session_state["reports"].append(report)
 
-        st.write("---")
-        st.subheader("Interview Questions")
-        questions = generate_questions_from_groq(resume_data['full_text'])
-        answers = []
-        for i, q in enumerate(questions):
-            ans = st.text_input(f"Q{i+1}: {q}", key=f"q_{i}")
-            answers.append(ans)
+elif menu == "Admin Dashboard":
+    admin_email = st.text_input("Admin Email")
+    admin_pass = st.text_input("Password", type="password")
 
-        if st.button("Submit Interview"):
-            score = calculate_score(answers, resume_data['skills'])
-            st.success(f"Interview Score: {score}%")
-
-            feedback = generate_data_visuals(resume_data['skills'])
-            send_feedback_email(resume_data['email'], resume_data['name'], resume_data['skills'][0] if resume_data['skills'] else 'Candidate', score, feedback)
-
-            with open(REPORTS_FILE, 'a', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                if os.path.getsize(REPORTS_FILE) == 0:
-                    writer.writerow(["name", "email", "role", "score", "timestamp"])
-                writer.writerow([resume_data['name'], resume_data['email'], resume_data['skills'][0] if resume_data['skills'] else 'N/A', score, datetime.now().isoformat()])
-
-            st.success("Report sent and saved ✅")
-
-            st.write("---")
-            st.subheader("Job Recommendations via Jooble")
-            jobs = fetch_job_recommendations(resume_data['skills'][0] if resume_data['skills'] else "developer")
-            for job in jobs:
-                st.markdown(f"**{job.get('title', 'N/A')}**  ")
-                st.markdown(f"{job.get('company', 'Unknown')} | {job.get('location', 'N/A')}  ")
-                st.markdown(f"[View Job Posting]({job.get('link')})")
+    if st.button("Login"):
+        if admin_email == ADMIN_EMAIL and admin_pass == ADMIN_PASSWORD:
+            st.success("Logged in as admin.")
+            reports = st.session_state.get("reports", [])
+            if reports:
+                df = pd.DataFrame(reports)
+                st.dataframe(df)
+                st.download_button("Download Report CSV", df.to_csv(index=False), "interview_reports.csv")
+            else:
+                st.warning("No reports found.")
+        else:
+            st.error("Invalid credentials.")
