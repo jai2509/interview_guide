@@ -14,7 +14,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from gtts import gTTS
 import speech_recognition as sr
 from pydub import AudioSegment
-from huggingface_hub import InferenceClient
+from sentence_transformers import SentenceTransformer
 from io import BytesIO
 import base64
 import pyspark
@@ -26,7 +26,7 @@ st.set_page_config(page_title="SmartHire AI", layout="centered")
 load_dotenv()
 nlp = spacy.load("en_core_web_sm")
 groq_api_key = os.getenv("GROQ_API_KEY")
-client = InferenceClient(model="sentence-transformers/all-MiniLM-L6-v2")
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 st.title("SmartHire AI - Interview & Job Assistant")
 
@@ -60,8 +60,8 @@ if uploaded_file:
     user_query = st.text_input("Your Question:")
 
     if user_query:
-        resume_embedding = client.embed(text)
-        query_embedding = client.embed(user_query)
+        resume_embedding = model.encode(text)
+        query_embedding = model.encode(user_query)
         similarity = cosine_similarity([resume_embedding], [query_embedding])[0][0]
 
         st.write(f"**Similarity Score:** {similarity:.2f}")
