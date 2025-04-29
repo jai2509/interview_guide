@@ -16,4 +16,5 @@ requests
 pyspark
  gdown==4.7.1
 seaborn
+PyPDF2
 
