@@ -14,5 +14,5 @@ pandas
 python-dotenv
 requests
 pyspark
-gdown
+ gdown==4.7.1
 
