@@ -1,169 +1,170 @@
-# app.py
+# SmartHire AI - Streamlit Version (Fully Integrated with Jooble & PySpark)
 
 import streamlit as st
-import pdfplumber
-import spacy
-import speech_recognition as sr
-import requests
-import json
+import pandas as pd
 import os
-from email.message import EmailMessage
-import smtplib
-import re
+import csv
+import requests
+from datetime import datetime
 from dotenv import load_dotenv
+from pyspark.sql import SparkSession
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import smtplib
+import zipfile
+import gdown
 
 # Load environment variables
 load_dotenv()
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+JOOBLE_API_KEY = os.getenv("JOOBLE_API_KEY")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@smarthireai.com")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
-# Load spaCy model
-nlp = spacy.load("en_core_web_sm")
+UPLOAD_FOLDER = "uploads"
+DATA_FOLDER = "data"
+REPORTS_FILE = os.path.join(DATA_FOLDER, "interview_reports.csv")
 
-# Extract skills from resume
-def extract_skills_from_resume(file):
-    skills = []
-    with pdfplumber.open(file) as pdf:
-        text = ""
-        for page in pdf.pages:
-            text += page.extract_text()
-        doc = nlp(text)
-        for token in doc:
-            if token.pos_ in ["NOUN", "PROPN"]:
-                skills.append(token.text.lower())
-    return list(set(skills))
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(DATA_FOLDER, exist_ok=True)
 
-# Call Groq API to generate interview questions
-def generate_interview_questions(skills, role):
-    prompt = f"""
-You are an expert AI interviewer.
-Generate 3 professional and technical interview questions for a candidate applying for the role of {role}.
-The candidate has the following skills: {', '.join(skills)}.
-Questions should test the candidate's knowledge deeply.
-Only output the questions without numbering or extra text.
-"""
-    groq_api_key = st.secrets["GROQ_API_KEY"]
-    endpoint = "https://api.groq.com/openai/v1/chat/completions"
+# Helper: Download & unzip LinkedIn dataset
+@st.cache_resource
+def download_and_extract_dataset():
+    url_id = "1gJW9kgdfnVU1FzlzijRiup_8gkJNit82"
+    zip_path = "linkedin_dataset.zip"
+    gdown.download(id=url_id, output=zip_path, quiet=False)
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(DATA_FOLDER)
+    os.remove(zip_path)
+    return os.path.join(DATA_FOLDER, "linkedin_dataset.csv")
 
-    headers = {
-        "Authorization": f"Bearer {groq_api_key}",
-        "Content-Type": "application/json"
+DATA_FILE = download_and_extract_dataset()
+
+# Resume Parsing Dummy
+@st.cache_data
+def parse_resume(file_path):
+    return {
+        "name": "John Doe",
+        "email": "john@example.com",
+        "skills": ["Python", "Data Analysis", "Machine Learning"],
+        "experience": "2 years at ABC Corp",
+        "education": "B.Sc. in Computer Science"
     }
 
-    data = {
-        "model": "llama3-70b-8192",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7
-    }
+# Generate Questions
+def generate_questions(role):
+    return [
+        f"What are the key responsibilities of a {role}?",
+        f"How do you stay updated with trends in {role}?",
+        f"Explain a project where you demonstrated {role}-related skills."
+    ]
 
-    response = requests.post(endpoint, headers=headers, data=json.dumps(data))
-    response.raise_for_status()
-    result = response.json()
+# Score Calculation
+def calculate_score(answers, keywords):
+    score = sum(1 for ans, kw in zip(answers, keywords) if kw.lower() in ans.lower())
+    return round((score / len(keywords)) * 100, 2)
 
-    generated_text = result['choices'][0]['message']['content']
-    questions = generated_text.strip().split('\n')
-    questions = [q.strip("-").strip() for q in questions if q.strip()]
-    return questions[:3]  # Return first 3 questions
-
-# Record and transcribe answer
-def record_answer():
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        st.info("Recording... Speak now!")
-        audio = r.listen(source, timeout=10, phrase_time_limit=60)
-        st.success("Recording complete!")
+# Jooble Integration
+def fetch_job_recommendations(role, location="India"):
     try:
-        text = r.recognize_google(audio)
-        return text
-    except sr.UnknownValueError:
-        return "Sorry, could not understand your answer."
-    except sr.RequestError:
-        return "Speech recognition service error."
+        url = f"https://jooble.org/api/{JOOBLE_API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        payload = {"keywords": role, "location": location, "page": 1, "searchMode": 1}
+        response = requests.post(url, json=payload, headers=headers)
+        jobs = response.json().get("jobs", [])
+        return jobs[:5]
+    except Exception as e:
+        st.error(f"Jooble Error: {e}")
+        return []
 
-# Analyze answer for feedback
-def analyze_answer(answer, expected_keywords):
-    feedback = ""
-    answer_lower = answer.lower()
-    
-    matched_keywords = [kw for kw in expected_keywords if kw.lower() in answer_lower]
-    coverage = len(matched_keywords) / len(expected_keywords) if expected_keywords else 0
+# PySpark Feedback
+def generate_bigdata_feedback(user_skills):
+    try:
+        spark = SparkSession.builder.appName("LinkedInAnalysis").getOrCreate()
+        df = spark.read.csv(DATA_FILE, header=True, inferSchema=True)
+        df = df.dropna(subset=["Skills"])
+        skill_match_count = df.rdd.map(lambda row: len(set(user_skills).intersection(set(row["Skills"].split(','))))).sum()
+        avg_match = round(skill_match_count / df.count(), 2)
+        spark.stop()
+        return f"Your skills match an average of {avg_match} LinkedIn profiles."
+    except Exception as e:
+        return f"Error analyzing LinkedIn data: {e}"
 
-    word_count = len(answer.split())
+# Email Feedback
+def send_feedback_email(to_email, name, role, score, feedback_note):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_USER
+        msg['To'] = to_email
+        msg['Subject'] = f"SmartHire AI Interview Report – {role}"
+        body = f"""Hello {name},\n\nThank you for your interview.\nScore: {score}%\n\nInsights:\n{feedback_note}\n\nBest,\nSmartHire AI"""
+        msg.attach(MIMEText(body, 'plain'))
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(EMAIL_USER, to_email, msg.as_string())
+        server.quit()
+    except Exception as e:
+        st.warning(f"Email error: {e}")
 
-    if word_count < 30:
-        feedback += "- Try to explain in more detail.\n"
-    elif word_count > 150:
-        feedback += "- Keep answers more concise.\n"
-    else:
-        feedback += "- Good explanation length.\n"
+# Streamlit App
+st.title("SmartHire AI - Career Interview Assistant")
 
-    if coverage > 0.7:
-        feedback += "- Covered most key points!\n"
-    elif coverage > 0.4:
-        feedback += "- Covered some key points, but missed a few.\n"
-    else:
-        feedback += "- Missed important concepts, please revise.\n"
+if "resume" not in st.session_state:
+    st.session_state.resume = {}
 
-    return feedback
-
-# Send feedback report via email
-def send_email_report(receiver_email, report_text):
-    sender_email = os.getenv("SENDER_EMAIL")
-    sender_password = os.getenv("SENDER_PASSWORD")
-
-    msg = EmailMessage()
-    msg['Subject'] = 'Your AI Interview Feedback Report'
-    msg['From'] = sender_email
-    msg['To'] = receiver_email
-    msg.set_content(report_text)
-
-    with smtplib.SMTP('smtp.gmail.com', 587) as smtp:
-        smtp.starttls()
-        smtp.login(sender_email, sender_password)
-        smtp.send_message(msg)
-
-# Streamlit UI
-def main():
-    st.set_page_config(page_title="AI Interview Expert", page_icon="🎤", layout="centered")
-    st.title("🎤 AI Interview Expert")
-    st.subheader("Upload Resume > Select Role > Speak Answers > Get AI Feedback")
-
-    uploaded_file = st.file_uploader("Upload your Resume (PDF)", type="pdf")
-
-    if uploaded_file is not None:
-        skills = extract_skills_from_resume(uploaded_file)
-        st.success(f"Resume parsed successfully! {len(skills)} skills detected.")
-
-        role = st.text_input("Enter your Target Role (example: Data Scientist, ML Engineer, etc.)")
-
-        if st.button("Generate Interview Questions"):
-            if role:
-                questions = generate_interview_questions(skills, role)
-                st.success("Interview questions generated successfully!")
-
-                report_text = f"AI Interview Feedback Report for Role: {role}\n\n"
-
-                for idx, question in enumerate(questions):
-                    st.markdown(f"### Question {idx+1}: {question}")
-                    
-                    if st.button(f"Record Answer for Q{idx+1}"):
-                        answer = record_answer()
-                        st.markdown(f"**Your Answer:** {answer}")
-
-                        expected_keywords = re.findall(r'\w+', question)
-                        feedback = analyze_answer(answer, expected_keywords)
-                        report_text += f"Question {idx+1}: {question}\n"
-                        report_text += f"Answer: {answer}\n"
-                        report_text += f"Feedback: {feedback}\n\n"
-
-                email = st.text_input("Enter your Email to receive Full Feedback Report:")
-
-                if st.button("Send Feedback Report"):
-                    if email:
-                        send_email_report(email, report_text)
-                        st.success("Feedback Report sent successfully!")
-                    else:
-                        st.error("Please enter a valid email address!")
+with st.sidebar:
+    st.header("Admin Login")
+    admin_user = st.text_input("Email")
+    admin_pass = st.text_input("Password", type="password")
+    if st.button("View Reports"):
+        if admin_user == ADMIN_EMAIL and admin_pass == ADMIN_PASSWORD:
+            if os.path.exists(REPORTS_FILE):
+                df = pd.read_csv(REPORTS_FILE, names=["Name", "Email", "Role", "Score", "Date"])
+                st.dataframe(df)
+                st.download_button("Download Reports CSV", df.to_csv(index=False), "interview_reports.csv")
             else:
-                st.error("Please enter a target role!")
+                st.info("No reports yet.")
+        else:
+            st.warning("Invalid credentials.")
 
-if __name__ == "__main__":
-    main()
+st.subheader("Upload Your Resume")
+input_lang = st.selectbox("Input Language", ["English", "Hindi", "French"])
+output_lang = st.selectbox("Output Language", ["English", "Hindi", "French"])
+file = st.file_uploader("Upload Resume (PDF)", type=["pdf"])
+
+if file:
+    file_path = os.path.join(UPLOAD_FOLDER, file.name)
+    with open(file_path, "wb") as f:
+        f.write(file.read())
+    resume_data = parse_resume(file_path)
+    st.session_state.resume = resume_data
+    st.success("Resume parsed successfully!")
+    st.write(resume_data)
+
+    role = st.text_input("Enter your desired role")
+    if role:
+        questions = generate_questions(role)
+        st.session_state.questions = questions
+        st.write("### Interview Questions")
+        answers = []
+        for i, q in enumerate(questions):
+            ans = st.text_area(f"{i+1}. {q}", key=f"answer_{i}")
+            answers.append(ans)
+
+        if st.button("Submit Interview"):
+            score = calculate_score(answers, ["responsibilities", "trends", "project"])
+            feedback_note = generate_bigdata_feedback(resume_data['skills'])
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(REPORTS_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([resume_data['name'], resume_data['email'], role, score, now])
+            send_feedback_email(resume_data['email'], resume_data['name'], role, score, feedback_note)
+            jobs = fetch_job_recommendations(role)
+            st.success(f"Interview Score: {score}%")
+            st.info(feedback_note)
+            st.write("### Job Recommendations")
+            for job in jobs:
+                st.write(f"**{job.get('title')}** at {job.get('company')}\n{job.get('snippet')}\n[View Job]({job.get('link')})")
