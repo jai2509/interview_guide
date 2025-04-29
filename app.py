@@ -5,8 +5,6 @@ import os
 import spacy
 import speech_recognition as sr
 from gtts import gTTS
-from pydub import AudioSegment
-from pydub.playback import play
 from dotenv import load_dotenv
 import tempfile
 import re
@@ -14,6 +12,10 @@ import requests
 import matplotlib.pyplot as plt
 import smtplib
 from email.message import EmailMessage
+from pydub import AudioSegment
+from pydub.playback import play
+from playsound import playsound
+import shutil
 
 # Load environment variables
 load_dotenv()
@@ -50,14 +52,22 @@ def record_audio(language="en-US"):
         return ""
 
 # ---------------------------
-# 🔊 Voice Output
+# 🔊 Voice Output (Improved)
 # ---------------------------
 def play_text(text, lang='en'):
     tts = gTTS(text=text, lang=lang)
-    filename = tempfile.mktemp(suffix=".mp3")
-    tts.save(filename)
-    audio = AudioSegment.from_file(filename)
-    play(audio)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+        tts.save(fp.name)
+        try:
+            if shutil.which("ffmpeg"):
+                # If ffmpeg exists, use pydub
+                audio = AudioSegment.from_file(fp.name)
+                play(audio)
+            else:
+                # Else fallback to playsound
+                playsound(fp.name)
+        except Exception as e:
+            st.error(f"Error playing audio: {e}")
 
 # ---------------------------
 # 🤖 Groq LLaMA3 Integration
@@ -193,7 +203,7 @@ if "questions" in st.session_state and st.session_state.step < len(st.session_st
 elif "qas" in st.session_state and st.session_state.step == len(st.session_state.questions):
     st.success("✅ Interview Complete. Generating Feedback...")
     resume_summary = " ".join(skills)
-    feedback = generate_feedback(role, resume_summary, st.session_state.qas, stt_lang_choice)
+    feedback = generate_feedback(role, resume_summary, st.session_state.qas, tts_lang_choice)
     st.session_state.feedback = feedback
     st.text_area("📄 Personalized Feedback", feedback, height=300)
 
@@ -203,7 +213,7 @@ elif "qas" in st.session_state and st.session_state.step == len(st.session_state
     tech_score, comm_score = extract_scores(feedback)
     display_dashboard(tech_score, comm_score)
 
-    user_email = st.text_input("\ud83d\udce7 Enter your email to receive this report")
-    if st.button("\ud83d\udce4 Send Feedback to Email"):
+    user_email = st.text_input("📧 Enter your email to receive this report")
+    if st.button("📤 Send Feedback to Email"):
         if send_feedback_email(user_email, feedback):
-            st.success("\u2705 Feedback sent successfully!")
+            st.success("✅ Feedback sent successfully!")
